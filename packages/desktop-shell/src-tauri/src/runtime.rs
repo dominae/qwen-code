@@ -220,17 +220,27 @@ pub(crate) fn resolve_workspace(configured: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Forcefully strips Windows extended-length prefixes (\\?\UNC\ and \\?\)
+/// Strips Windows extended-length prefixes (\\?\UNC\ and \\?\) when the
+/// resulting path is still short enough for legacy (non-verbatim) Win32 APIs
+/// to address. Paths at or beyond `MAX_PATH` (260 UTF-16 code units) must
+/// keep the prefix, since dropping it would make them unaddressable rather
+/// than merely differently formatted.
 fn sanitize_verbatim_path(path: PathBuf) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
+        const MAX_PATH: usize = 260;
         let path_str = path.to_string_lossy();
-        if path_str.starts_with(r"\\?\UNC\") {
+        let stripped = if let Some(rest) = path_str.strip_prefix(r"\\?\UNC\") {
             // Convert \\?\UNC\ash-hp\QWen -> \\ash-hp\QWen
-            return PathBuf::from(format!(r"\\{}", &path_str[8..]));
-        } else if path_str.starts_with(r"\\?\") {
+            Some(format!(r"\\{rest}"))
+        } else {
             // Convert \\?\C:\path -> C:\path
-            return PathBuf::from(&path_str[4..]);
+            path_str.strip_prefix(r"\\?\").map(str::to_string)
+        };
+        if let Some(stripped) = stripped {
+            if stripped.encode_utf16().count() < MAX_PATH {
+                return PathBuf::from(stripped);
+            }
         }
     }
     path
