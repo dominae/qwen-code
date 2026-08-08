@@ -151,11 +151,19 @@ impl RuntimeLayout {
                 .join("runtime")
                 .join("qwen-code")
         } else {
-            app.path()
-                .resource_dir()
-                .map_err(|error| format!("Failed to resolve desktop resources: {error}"))?
-                .join("runtime")
-                .join("qwen-code")
+            // Tauri's resource_dir() returns a Windows extended-length
+            // (`\\?\`) path. Node's own bootstrap realpath logic does not
+            // understand that prefix and mis-parses the root as the bare
+            // string "C:", which crashes with EISDIR trying to lstat it
+            // (#8615). Strip it before it's joined into the node/entry
+            // paths handed to the child process as argv.
+            sanitize_verbatim_path(
+                app.path()
+                    .resource_dir()
+                    .map_err(|error| format!("Failed to resolve desktop resources: {error}"))?,
+            )
+            .join("runtime")
+            .join("qwen-code")
         };
         let node = if cfg!(windows) {
             root.join("node").join("node.exe")
@@ -190,13 +198,17 @@ fn ensure_supported_workspace_path(path: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn resolve_workspace(configured: &Path) -> Result<PathBuf, String> {
-    // dunce::canonicalize strips the Windows `\\?\` prefix when safe (#8615).
+    // 1. Attempt dunce canonicalize first
     let workspace = dunce::canonicalize(configured).map_err(|error| {
         format!(
             "Failed to resolve desktop workspace {}: {error}",
             configured.display()
         )
     })?;
+
+    // 2. Force-strip verbatim UNC / drive prefixes that dunce leaves behind
+    let workspace = sanitize_verbatim_path(workspace);
+
     ensure_supported_workspace_path(&workspace)?;
     if workspace.is_dir() {
         Ok(workspace)
@@ -206,6 +218,22 @@ pub(crate) fn resolve_workspace(configured: &Path) -> Result<PathBuf, String> {
             workspace.display()
         ))
     }
+}
+
+/// Forcefully strips Windows extended-length prefixes (\\?\UNC\ and \\?\)
+fn sanitize_verbatim_path(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = path.to_string_lossy();
+        if path_str.starts_with(r"\\?\UNC\") {
+            // Convert \\?\UNC\ash-hp\QWen -> \\ash-hp\QWen
+            return PathBuf::from(format!(r"\\{}", &path_str[8..]));
+        } else if path_str.starts_with(r"\\?\") {
+            // Convert \\?\C:\path -> C:\path
+            return PathBuf::from(&path_str[4..]);
+        }
+    }
+    path
 }
 
 fn random_token() -> String {
